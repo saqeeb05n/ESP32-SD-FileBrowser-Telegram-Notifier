@@ -1,0 +1,536 @@
+/*
+  ESP32 SD File Browser + Telegram IP Notifier + Dual WiFi + Upload + Storage Info
+
+  Wiring (SPI):
+    CS=5, MOSI=23, MISO=19, SCK=18
+*/
+
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define SD_CS   5
+#define SD_MOSI 23
+#define SD_MISO 19
+#define SD_SCK  18
+
+// ---- WiFi (add two networks) ----
+const char* WIFI_SSID_1 = "Wifi name 1";
+const char* WIFI_PASS_1 = "wifi password 1";
+//const char* WIFI_SSID_2 = "Wifi name 2";
+//const char* WIFI_PASS_2 = "password 2";
+
+// ---- Telegram ----
+const char* BOT_TOKEN = "Telegram Bot ID";   // from @BotFather
+const char* CHAT_ID   = "chat ID";        // your user/chat id, where you want to recieve ip address of esp32
+
+// ---- HTTP Basic Auth ----
+const char* HTTP_USER = "admin";       //user id
+const char* HTTP_PASS = "esp32pass";   // password to access
+
+WiFiMulti wifiMulti;
+WebServer server(80);
+
+// Track authentication status
+bool isAuthenticated = false;
+
+// ---------- Helpers ----------
+
+String urlEncode(const String& s) {
+  String out;
+  char buf[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else if (c == ' ') {
+      out += '+';
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+String urlDecode(const String& s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '+') {
+      out += ' ';
+    } else if (c == '%' && i + 2 < s.length()) {
+      char hex[3] = {s[i+1], s[i+2], '\0'};
+      out += (char)strtol(hex, NULL, 16);
+      i += 2;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+String contentTypeForPath(const String& path) {
+  String p = path;
+  p.toLowerCase();
+
+  if (p.endsWith(".htm") || p.endsWith(".html")) return "text/html";
+  if (p.endsWith(".css"))  return "text/css";
+  if (p.endsWith(".js"))   return "application/javascript";
+  if (p.endsWith(".json")) return "application/json";
+  if (p.endsWith(".txt"))  return "text/plain";
+  if (p.endsWith(".csv"))  return "text/csv";
+  if (p.endsWith(".pdf"))  return "application/pdf";
+  if (p.endsWith(".png"))  return "image/png";
+  if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+  if (p.endsWith(".gif"))  return "image/gif";
+  if (p.endsWith(".svg"))  return "image/svg+xml";
+  if (p.endsWith(".bmp"))  return "image/bmp";
+  if (p.endsWith(".ico"))  return "image/x-icon";
+  if (p.endsWith(".mp3"))  return "audio/mpeg";
+  if (p.endsWith(".wav"))  return "audio/wav";
+  if (p.endsWith(".ogg"))  return "audio/ogg";
+  if (p.endsWith(".mp4"))  return "video/mp4";
+  if (p.endsWith(".webm")) return "video/webm";
+  if (p.endsWith(".m4v"))  return "video/x-m4v";
+  if (p.endsWith(".doc"))  return "application/msword";
+  if (p.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (p.endsWith(".xls"))  return "application/vnd.ms-excel";
+  if (p.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (p.endsWith(".ppt"))  return "application/vnd.ms-powerpoint";
+  if (p.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  return "application/octet-stream";
+}
+
+bool ensureAuth() {
+  if (isAuthenticated) return true;
+  
+  if (server.hasHeader("Cookie")) {
+    String cookie = server.header("Cookie");
+    if (cookie.indexOf("ESPSESSIONID=1") != -1) {
+      isAuthenticated = true;
+      return true;
+    }
+  }
+  
+  String loginPage = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  loginPage += "<title>Login Required</title>";
+  loginPage += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b1220;color:#e8eefc;display:flex;justify-content:center;align-items:center;height:100vh}";
+  loginPage += ".login-box{background:#13203b;border:1px solid #203558;border-radius:14px;padding:30px;width:300px;text-align:center}";
+  loginPage += "h2{margin:0 0 20px 0}input{padding:12px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #2a4480;background:#152743;color:#e8eefc}";
+  loginPage += "button{padding:12px;width:100%;border-radius:8px;border:none;background:#274a86;color:#fff;cursor:pointer;margin-top:10px}</style></head>";
+  loginPage += "<body><div class='login-box'><h2>ESP32 File Browser</h2><form method='POST' action='/login'>";
+  loginPage += "<input type='text' name='username' placeholder='Username' required>";
+  loginPage += "<input type='password' name='password' placeholder='Password' required>";
+  loginPage += "<button type='submit'>Login</button></form></div></body></html>";
+  
+  server.send(401, "text/html", loginPage);
+  return false;
+}
+
+String niceSize(uint64_t bytes) {
+  char buf[32];
+  if (bytes < 1024ULL) {
+    snprintf(buf, sizeof(buf), "%llubytes", bytes);
+  } else if (bytes < 1024ULL*1024ULL) {
+    snprintf(buf, sizeof(buf), "%.2f KB", bytes / 1024.0);
+  } else if (bytes < 1024ULL*1024ULL*1024ULL) {
+    snprintf(buf, sizeof(buf), "%.2f MB", bytes / 1048576.0);
+  } else {
+    snprintf(buf, sizeof(buf), "%.2f GB", bytes / 1073741824.0);
+  }
+  return String(buf);
+}
+
+String getStorageInfo() {
+  uint64_t cardSize = SD.cardSize();
+  uint64_t totalBytes = SD.totalBytes();
+  uint64_t usedBytes = SD.usedBytes();
+  
+  String info = "Card: " + niceSize(cardSize);
+  info += " | Total: " + niceSize(totalBytes);
+  info += " | Used: " + niceSize(usedBytes);
+  info += " | Free: " + niceSize(totalBytes - usedBytes);
+  
+  return info;
+}
+
+// FIX: Corrected recursive delete logic
+bool deleteFolder(String path) {
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) {
+    dir.close();
+    return false; // Not a directory or doesn't exist
+  }
+
+  dir.rewindDirectory();
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      // No more entries
+      break;
+    }
+
+    // entry.name() already returns the full absolute path.
+    String entryPath = String(entry.name());
+
+    if (entry.isDirectory()) {
+      entry.close(); // Close the entry before recursive call
+      // Recursively delete subdirectory
+      if (!deleteFolder(entryPath)) {
+        dir.close();
+        return false;
+      }
+    } else {
+      // Delete file
+      entry.close(); // Close the file entry
+      if (!SD.remove(entryPath)) {
+        dir.close();
+        return false;
+      }
+    }
+  }
+
+  // All contents have been deleted, now remove the empty folder
+  dir.close();
+  return SD.rmdir(path);
+}
+
+String normalizePath(String path) {
+  if (path.length() == 0) return "/";
+  if (!path.startsWith("/")) path = "/" + path;
+  while (path.length() > 1 && path.endsWith("/")) path.remove(path.length() - 1);
+  return path;
+}
+
+String getParentDir(String path) {
+  path = normalizePath(path);
+  if (path == "/") return path;
+  int lastSlash = path.lastIndexOf('/');
+  if (lastSlash <= 0) return "/";
+  return path.substring(0, lastSlash);
+}
+
+String buildPath(String dir, String filename) {
+  dir = normalizePath(dir);
+  if (dir == "/") return dir + filename;
+  return dir + "/" + filename;
+}
+
+String getFilenameFromPath(String path) {
+  int lastSlash = path.lastIndexOf('/');
+  if (lastSlash < 0) return path;
+  return path.substring(lastSlash + 1);
+}
+
+bool isDirectory(String path) {
+  File file = SD.open(path);
+  if (!file) return false;
+  bool result = file.isDirectory();
+  file.close();
+  return result;
+}
+
+// ---------- UI ----------
+
+String headerHTML(const String& title) {
+  // FIX: Added <meta charset="UTF-8"> to ensure emojis and special characters render correctly.
+  String h = "<!doctype html><html><head><meta charset=\"UTF-8\"><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<title>" + title + "</title>";
+  h += "<style>"
+       "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b1220;color:#e8eefc}"
+       "header{background:#111a2e;padding:16px 20px;position:sticky;top:0;box-shadow:0 2px 8px rgba(0,0,0,.3);z-index:100}"
+       "h1{font-size:18px;margin:0}"
+       ".container{padding:16px 20px}"
+       ".card{background:#13203b;border:1px solid #203558;border-radius:14px;padding:14px;margin:10px 0}"
+       "a{color:#7db2ff;text-decoration:none}"
+       "table{width:100%;border-collapse:collapse;table-layout:fixed}"
+       "th,td{padding:10px;border-bottom:1px solid #1f3557;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+       "th:nth-child(1),td:nth-child(1){width:55%}"
+       "th:nth-child(2),td:nth-child(2){width:20%}"
+       "th:nth-child(3),td:nth-child(3){width:25%}"
+       "tr:hover{background:#0f1a31}"
+       ".path{opacity:.85}"
+       ".btn{display:inline-block;padding:8px 12px;border-radius:10px;background:#274a86;color:#fff;border:1px solid #315a9f;font-size:12px;white-space:nowrap}"
+       ".btn:hover{filter:brightness(1.1)}"
+       ".row{display:flex;gap:10px;flex-wrap:wrap}"
+       "form{display:flex;flex-direction:column;gap:10px;margin:15px 0}"
+       "input,button,select{padding:10px;border-radius:8px;border:1px solid #2a4480;background:#152743;color:#e8eefc}"
+       "button{background:#274a86;cursor:pointer}"
+       ".storage-info{font-size:12px;opacity:0.8;margin-top:5px}"
+       ".modal{display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7)}"
+       ".modal-content{background:#13203b;margin:15% auto;padding:20px;border:1px solid #203558;border-radius:14px;width:80%;max-width:400px}"
+       ".actions{display:flex;gap:5px;flex-wrap:wrap}"
+       ".filename-cell{max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+       ".btn-danger{background:#863427}"
+       "</style>"
+       "<script>"
+       "function showCreateFolder() { document.getElementById('folderModal').style.display = 'block'; }"
+       "function closeModal() { document.getElementById('folderModal').style.display = 'none'; }"
+       "function confirmDelete(path, name, isFolder) { "
+       "  var msg = isFolder ? 'WARNING: This will delete the folder and ALL its contents!\\n\\nDelete folder \"' + name + '\"?' : 'Delete file \"' + name + '\"?';"
+       "  return confirm(msg); }"
+       "</script>"
+       "</head><body><header><h1>" + title + "</h1></header><div class='container'>";
+  return h;
+}
+
+String footerHTML() { return "</div></body></html>"; }
+
+String listDirHTML(const String& dirPath) {
+  String page = headerHTML("ESP32 SD Browser");
+  String currentDir = normalizePath(dirPath);
+  File dir = SD.open(currentDir);
+  
+  if (!dir || !dir.isDirectory()) {
+    page += "<div class='card'>Directory not found: <b class='path'>" + currentDir + "</b></div>";
+    page += footerHTML();
+    return page;
+  }
+
+  page += "<div class='card'>";
+  page += "<div>" + getStorageInfo() + "</div>";
+  page += "<form method='post' action='/upload' enctype='multipart/form-data'>";
+  page += "<input type='hidden' name='dir' value='" + currentDir + "'>";
+  page += "<div style='display:flex;gap:10px;align-items:center;flex-wrap:wrap'>";
+  page += "<input type='file' name='file' required style='flex:1'>";
+  page += "<button type='submit'>Upload File</button>";
+  page += "<button type='button' onclick='showCreateFolder()' style='background:#2c554e'>Create Folder</button>";
+  page += "</div></form></div>";
+
+  page += "<div id='folderModal' class='modal'><div class='modal-content'><h3>Create New Folder</h3>";
+  page += "<form method='post' action='/createFolder'>";
+  page += "<input type='hidden' name='dir' value='" + currentDir + "'>";
+  page += "<input type='text' name='name' placeholder='Folder name' required>";
+  page += "<div style='display:flex;gap:10px;justify-content:flex-end'>";
+  page += "<button type='button' onclick='closeModal()' style='background:#555'>Cancel</button>";
+  page += "<button type='submit'>Create</button>";
+  page += "</div></form></div></div>";
+
+  page += "<div class='card'>Path: <b class='path'>" + currentDir + "</b>";
+  if (currentDir != "/") {
+    String parent = getParentDir(currentDir);
+    page += " &nbsp; <a class='btn' href='/?dir=" + urlEncode(parent) + "'>&larr; Up</a>";
+  }
+  page += "</div>";
+
+  page += "<div class='card'><table><tr><th>Name</th><th>Size</th><th>Actions</th></tr>";
+  if (currentDir != "/") {
+    String parentDir = getParentDir(currentDir);
+    page += "<tr><td class='filename-cell'>📁 <a href='/?dir=" + urlEncode(parentDir) + "'>.. (Parent Directory)</a></td><td>—</td><td>—</td></tr>";
+  }
+
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+
+    String displayName = getFilenameFromPath(String(entry.name()));
+    String fullPath = buildPath(currentDir, displayName);
+    bool isDir = entry.isDirectory();
+
+    page += "<tr><td class='filename-cell'>";
+    if (isDir) {
+      page += "📁 <a href='/?dir=" + urlEncode(fullPath) + "' title='" + displayName + "'>" + displayName + "</a></td><td>—</td><td>";
+      page += "<div class='actions'><a class='btn btn-danger' href='/deleteFolder?path=" + urlEncode(fullPath) + "&dir=" + urlEncode(currentDir) + "' onclick='return confirmDelete(\"" + fullPath + "\", \"" + displayName + "\", true)'>Delete</a></div>";
+    } else {
+      page += "📄 <span title='" + displayName + "'>" + displayName + "</span></td><td>" + niceSize(entry.size()) + "</td><td>";
+      page += "<div class='actions'>";
+      page += "<a class='btn' href='/view?path=" + urlEncode(fullPath) + "'>View</a>";
+      page += "<a class='btn' href='/download?path=" + urlEncode(fullPath) + "'>Download</a>";
+      page += "<a class='btn btn-danger' href='/delete?path=" + urlEncode(fullPath) + "&dir=" + urlEncode(currentDir) + "' onclick='return confirmDelete(\"" + fullPath + "\", \"" + displayName + "\", false)'>Delete</a>";
+      page += "</div>";
+    }
+    page += "</td></tr>";
+    entry.close();
+  }
+  page += "</table></div>";
+  page += "<div class='card'>Wi-Fi: <b>" + WiFi.SSID() + "</b> &nbsp;|&nbsp; IP: <b>" + WiFi.localIP().toString() + "</b></div>";
+  page += footerHTML();
+  return page;
+}
+
+// ---------- Routes (omitting for brevity, no changes from previous version) ----------
+void handleLogin() {
+  if (server.hasArg("username") && server.hasArg("password")) {
+    String username = server.arg("username");
+    String password = server.arg("password");
+    
+    if (username == HTTP_USER && password == HTTP_PASS) {
+      isAuthenticated = true;
+      server.sendHeader("Location", "/");
+      server.sendHeader("Set-Cookie", "ESPSESSIONID=1");
+      server.send(303);
+      return;
+    }
+  }
+  
+  String loginPage = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  loginPage += "<title>Login Failed</title>";
+  loginPage += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b1220;color:#e8eefc;display:flex;justify-content:center;align-items:center;height:100vh}";
+  loginPage += ".login-box{background:#13203b;border:1px solid #203558;border-radius:14px;padding:30px;width:300px;text-align:center}";
+  loginPage += "h2{margin:0 0 20px 0}input{padding:12px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #2a4480;background:#152743;color:#e8eefc}";
+  loginPage += "button{padding:12px;width:100%;border-radius:8px;border:none;background:#274a86;color:#fff;cursor:pointer;margin-top:10px}.error{color:#ff6b6b;margin-top:10px}</style></head>";
+  loginPage += "<body><div class='login-box'><h2>ESP32 File Browser</h2><div class='error'>Invalid credentials</div><form method='POST' action='/login'>";
+  loginPage += "<input type='text' name='username' placeholder='Username' required>";
+  loginPage += "<input type='password' name='password' placeholder='Password' required>";
+  loginPage += "<button type='submit'>Login</button></form></div></body></html>";
+  
+  server.send(401, "text/html", loginPage);
+}
+
+void handleRoot() {
+  if (!ensureAuth()) return;
+  String dir = server.hasArg("dir") ? urlDecode(server.arg("dir")) : "/";
+  server.send(200, "text/html; charset=utf-8", listDirHTML(dir));
+}
+
+void handleView() {
+  if (!ensureAuth()) return;
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path"); return; }
+  String path = urlDecode(server.arg("path"));
+  File file = SD.open(path);
+  if (!file || file.isDirectory()) { server.send(404, "text/plain", "File Not Found"); return; }
+  server.streamFile(file, contentTypeForPath(path));
+  file.close();
+}
+
+void handleDownload() {
+  if (!ensureAuth()) return;
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path"); return; }
+  String path = urlDecode(server.arg("path"));
+  File file = SD.open(path);
+  if (!file || file.isDirectory()) { server.send(404, "text/plain", "File Not Found"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + getFilenameFromPath(path) + "\"");
+  server.streamFile(file, contentTypeForPath(path));
+  file.close();
+}
+
+void handleFileUpload() {
+  if (!ensureAuth()) return;
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String currentDir = server.hasArg("dir") ? urlDecode(server.arg("dir")) : "/";
+    String filename = upload.filename;
+    if (filename.lastIndexOf('/') >= 0) filename = filename.substring(filename.lastIndexOf('/') + 1);
+    String fullPath = buildPath(currentDir, filename);
+    if (SD.exists(fullPath)) SD.remove(fullPath);
+    upload.filename = fullPath;
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    File file = SD.open(upload.filename, FILE_APPEND);
+    if (file) {
+      file.write(upload.buf, upload.currentSize);
+      file.close();
+    }
+  }
+}
+
+void handleUploadSuccess() {
+  if (!isAuthenticated) return;
+  String currentDir = server.hasArg("dir") ? urlDecode(server.arg("dir")) : "/";
+  server.sendHeader("Location", "/?dir=" + urlEncode(currentDir), true);
+  server.send(303);
+}
+
+void handleCreateFolder() {
+  if (!ensureAuth()) return;
+  if (!server.hasArg("dir") || !server.hasArg("name")) { server.send(400, "text/plain", "Missing parameters"); return; }
+  String dir = urlDecode(server.arg("dir"));
+  String name = server.arg("name");
+  if (name.length() == 0) { server.send(400, "text/plain", "Folder name cannot be empty"); return; }
+  name.replace("/", "_");
+  String fullPath = buildPath(dir, name);
+  if (SD.mkdir(fullPath)) {
+    server.sendHeader("Location", "/?dir=" + urlEncode(dir), true);
+    server.send(303);
+  } else {
+    server.send(500, "text/plain", "Failed to create folder");
+  }
+}
+
+void handleDelete() {
+  if (!ensureAuth()) return;
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path"); return; }
+  String path = urlDecode(server.arg("path"));
+  String dir = server.hasArg("dir") ? urlDecode(server.arg("dir")) : "/";
+  if (SD.remove(path)) {
+    server.sendHeader("Location", "/?dir=" + urlEncode(dir), true);
+    server.send(303);
+  } else {
+    server.send(500, "text/plain", "Delete failed");
+  }
+}
+
+void handleDeleteFolder() {
+  if (!ensureAuth()) return;
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path"); return; }
+  String path = urlDecode(server.arg("path"));
+  String dir = server.hasArg("dir") ? urlDecode(server.arg("dir")) : "/";
+  if (deleteFolder(path)) {
+    server.sendHeader("Location", "/?dir=" + urlEncode(dir), true);
+    server.send(303);
+  } else {
+    server.send(500, "text/plain", "Delete folder failed: " + path);
+  }
+}
+
+void handleLogout() {
+  isAuthenticated = false;
+  server.sendHeader("Set-Cookie", "ESPSESSIONID=0; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  server.sendHeader("Location", "/login");
+  server.send(303);
+}
+
+void handleNotFound() {
+  if (!ensureAuth()) return;
+  server.send(404, "text/plain", "Not found");
+}
+
+// ---------- Telegram (omitting for brevity, no changes) ----------
+bool sendTelegramMessage(const String& text) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("api.telegram.org", 443)) return false;
+  String url = "/bot" + String(BOT_TOKEN) + "/sendMessage";
+  String payload = "chat_id=" + String(CHAT_ID) + "&text=" + urlEncode(text);
+  client.print(String("POST ") + url + " HTTP/1.1\r\n" +
+               "Host: api.telegram.org\r\n" +
+               "Content-Type: application/x-www-form-urlencoded\r\n" +
+               "Connection: close\r\n" +
+               "Content-Length: " + String(payload.length()) + "\r\n\r\n" +
+               payload);
+  return true;
+}
+// ---------- Setup / Loop (omitting for brevity, no changes) ----------
+void setup() {
+  Serial.begin(115200);
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) Serial.println("SD mount failed");
+
+  wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
+  Serial.print("Connecting Wi-Fi");
+  while (wifiMulti.run() != WL_CONNECTED) { Serial.print("."); delay(500); }
+  Serial.println("\nConnected to: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString());
+  
+  sendTelegramMessage("ESP32 online.\nSSID: " + WiFi.SSID() + "\nIP: " + WiFi.localIP().toString());
+
+  server.on("/", handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/view", handleView);
+  server.on("/download", handleDownload);
+  server.on("/upload", HTTP_POST, handleUploadSuccess, handleFileUpload);
+  server.on("/createFolder", HTTP_POST, handleCreateFolder);
+  server.on("/delete", handleDelete);
+  server.on("/deleteFolder", handleDeleteFolder);
+  server.on("/logout", handleLogout);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("HTTP server started.");
+}
+
+void loop() {
+  server.handleClient();
+}
